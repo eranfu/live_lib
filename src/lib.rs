@@ -1,4 +1,6 @@
-use std::collections::{HashMap, LinkedList};
+#![feature(map_first_last)]
+
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
@@ -22,7 +24,7 @@ pub struct Loader<P: LibPartner = ()> {
     lib_name_to_lib: HashMap<String, Lib<P>>,
     origin_path_to_lib_name: HashMap<PathBuf, String>,
     search_dirs: Vec<PathBuf>,
-    pending_remove: LinkedList<PathBuf>,
+    pending_remove: BTreeSet<PathBuf>,
 }
 
 impl<P: LibPartner> Loader<P> {
@@ -52,8 +54,9 @@ impl<P: LibPartner> Loader<P> {
             return Ok(());
         }
 
-        let (origin_path, load_path) = Self::search(&self.search_dirs, lib_name)
-            .chain_err(|| format!("Library not exists. name: {}", lib_name))?;
+        let (origin_path, load_path) =
+            Self::search(&self.search_dirs, lib_name, &mut self.pending_remove)
+                .chain_err(|| format!("Library not exists. name: {}", lib_name))?;
 
         self.add(lib_name.to_owned(), origin_path.clone(), load_path)?;
         self.file_watcher
@@ -81,11 +84,11 @@ impl<P: LibPartner> Loader<P> {
     }
 
     pub fn update(&mut self) -> Result<()> {
-        while let Some(to_remove) = self.pending_remove.front() {
+        while let Some(to_remove) = self.pending_remove.first() {
             if to_remove.exists() && std::fs::remove_file(&to_remove).is_err() {
                 break;
             } else {
-                self.pending_remove.pop_front();
+                self.pending_remove.pop_first();
             };
         }
 
@@ -94,18 +97,11 @@ impl<P: LibPartner> Loader<P> {
             match event {
                 Ok(event) => match event {
                     DebouncedEvent::Create(path) | DebouncedEvent::Write(path) => {
-                        self.remove(&path)?;
-
+                        let lib_name = self.remove(&path)?;
                         let mut dir = path.clone();
-                        let file_name: &str = dir
-                            .file_name()
-                            .and_then(|file_name| file_name.to_str())
-                            .chain_err(|| format!("Failed to get filename. path: {:?}", dir))?;
-                        let lib_name = utils::extract_lib_name(file_name).chain_err(|| {
-                            format!("Failed to extract lib_name. file_name: {}", file_name)
-                        })?;
                         dir.pop();
-                        let load_path = utils::get_load_path(dir, &lib_name);
+                        let load_path =
+                            Self::get_load_path(dir, &lib_name, &mut self.pending_remove);
                         self.add(lib_name, path, load_path)?;
                     }
 
@@ -137,12 +133,16 @@ impl<P: LibPartner> Loader<P> {
         Ok(())
     }
 
-    fn search(search_dirs: &[PathBuf], lib_name: &str) -> Option<(PathBuf, PathBuf)> {
+    fn search(
+        search_dirs: &[PathBuf],
+        lib_name: &str,
+        pending_remove: &mut BTreeSet<PathBuf>,
+    ) -> Option<(PathBuf, PathBuf)> {
         let file_name = libloading::library_filename(lib_name);
         for dir in search_dirs {
             let origin_path = dir.join(&file_name);
             if origin_path.exists() {
-                let load_path = utils::get_load_path(dir.clone(), lib_name);
+                let load_path = Self::get_load_path(dir.clone(), lib_name, pending_remove);
                 return Some((origin_path, load_path));
             }
         }
@@ -167,17 +167,61 @@ impl<P: LibPartner> Loader<P> {
         self.lib_name_to_lib.insert(lib.lib_name.clone(), lib);
         Ok(())
     }
-    fn remove(&mut self, origin_path: &Path) -> Result<()> {
+
+    fn remove(&mut self, origin_path: &Path) -> Result<String> {
         let lib_name = self
             .origin_path_to_lib_name
             .remove(origin_path)
             .chain_err(|| format!("Failed to find lib_name. origin_path: {:?}", origin_path))?;
-        let lib = self
-            .lib_name_to_lib
-            .remove(&lib_name)
-            .chain_err(|| format!("Failed to find lib. lib_name: {:?}", lib_name))?;
-        self.pending_remove.push_back(lib.load_path.clone());
-        Ok(())
+        Self::remove_file(
+            self.lib_name_to_lib
+                .remove(&lib_name)
+                .chain_err(|| format!("Failed to find lib. lib_name: {:?}", lib_name))?,
+            &mut self.pending_remove,
+        );
+        Ok(lib_name)
+    }
+
+    fn remove_file(lib: Lib<P>, pending_remove: &mut BTreeSet<PathBuf>) {
+        let load_path = lib.load_path.clone();
+        drop(lib);
+        if std::fs::remove_file(&load_path).is_err() {
+            pending_remove.insert(load_path);
+        }
+    }
+
+    fn get_load_path(
+        mut dir: PathBuf,
+        lib_name: &str,
+        pending_remove: &mut BTreeSet<PathBuf>,
+    ) -> PathBuf {
+        use std::env::consts::*;
+        const LIVE_SUFFIX: &str = "_live";
+        let mut i = 0;
+        let mut live_file_name = String::with_capacity(
+            DLL_PREFIX.len() + lib_name.len() + LIVE_SUFFIX.len() + 3 + DLL_SUFFIX.len(),
+        );
+        live_file_name += DLL_PREFIX;
+        live_file_name += lib_name;
+        live_file_name += LIVE_SUFFIX;
+        let len = live_file_name.len();
+        loop {
+            live_file_name += &i.to_string();
+            live_file_name += DLL_SUFFIX;
+            dir.push(&live_file_name);
+
+            if !dir.exists() {
+                return dir;
+            }
+            if std::fs::remove_file(&dir).is_ok() {
+                pending_remove.remove(&dir);
+                return dir;
+            }
+
+            dir.pop();
+            live_file_name.truncate(len);
+            i += 1;
+        }
     }
 }
 
@@ -185,10 +229,10 @@ impl<P: LibPartner> Drop for Loader<P> {
     fn drop(&mut self) {
         self.origin_path_to_lib_name.clear();
         for (_, lib) in self.lib_name_to_lib.drain() {
-            self.pending_remove.push_back(lib.load_path.clone());
+            Self::remove_file(lib, &mut self.pending_remove);
         }
-        while let Some(to_remove) = self.pending_remove.pop_front() {
-            while to_remove.exists() && std::fs::remove_file(&to_remove).is_err() {
+        for to_remove in self.pending_remove.iter() {
+            while to_remove.exists() && std::fs::remove_file(to_remove).is_err() {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -233,82 +277,6 @@ impl<P: LibPartner> Drop for Lib<P> {
             .err()
         {
             eprintln!("{}", err.display_chain());
-        }
-    }
-}
-
-mod utils {
-    use std::path::PathBuf;
-
-    use ::error_chain::error_chain;
-    use lazy_static::lazy_static;
-    use regex::Regex;
-
-    error_chain! {}
-
-    pub(crate) fn get_load_path(mut dir: PathBuf, lib_name: &str) -> PathBuf {
-        use std::env::consts::*;
-        const LIVE_SUFFIX: &str = "_live";
-        let mut i = 0;
-        let mut live_file_name = String::with_capacity(
-            DLL_PREFIX.len() + lib_name.len() + LIVE_SUFFIX.len() + 3 + DLL_SUFFIX.len(),
-        );
-        live_file_name += DLL_PREFIX;
-        live_file_name += lib_name;
-        live_file_name += LIVE_SUFFIX;
-        let len = live_file_name.len();
-        loop {
-            live_file_name += &i.to_string();
-            live_file_name += DLL_SUFFIX;
-            dir.push(&live_file_name);
-            if !dir.exists() {
-                return dir;
-            }
-
-            if std::fs::remove_file(&dir).is_ok() {
-                return dir;
-            }
-
-            dir.pop();
-            live_file_name.truncate(len);
-            i += 1;
-        }
-    }
-
-    pub(crate) fn extract_lib_name(file_name: &str) -> Result<String> {
-        lazy_static! {
-            static ref REGEX: Regex = Regex::new(&format!(
-                r"^{}(.+){}$",
-                std::env::consts::DLL_PREFIX,
-                std::env::consts::DLL_SUFFIX,
-            ))
-            .unwrap();
-        }
-
-        REGEX
-            .captures(file_name)
-            .and_then(|cap| cap.get(1))
-            .map(|ma| ma.as_str().to_owned())
-            .chain_err(|| format!("Failed to get lib_name. file_name: {:?}", file_name))
-    }
-
-    #[cfg(test)]
-    mod tests {
-        #[test]
-        fn extract_lib_name() {
-            let file_name = format!(
-                "{}gl32{}",
-                std::env::consts::DLL_PREFIX,
-                std::env::consts::DLL_SUFFIX
-            );
-            assert_eq!(crate::utils::extract_lib_name(&file_name).unwrap(), "gl32");
-
-            let file_name = format!(
-                "{}gl32{}a",
-                std::env::consts::DLL_PREFIX,
-                std::env::consts::DLL_SUFFIX
-            );
-            assert!(crate::utils::extract_lib_name(&file_name).is_err());
         }
     }
 }
