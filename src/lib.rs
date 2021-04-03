@@ -1,8 +1,5 @@
-#![feature(once_cell)]
-
-use std::collections::{HashMap, LinkedList};
 use std::collections::hash_map::Entry;
-use std::ffi::{OsStr, OsString};
+use std::collections::{HashMap, LinkedList};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::time::Duration;
@@ -40,9 +37,9 @@ impl<D, R: ResultExt<()>> Loader<D, R> {
         let mut exe_dir = std::env::current_exe().chain_err(|| "Failed to get current_exe")?;
         exe_dir.pop();
         #[cfg(test)]
-            {
-                exe_dir.pop();
-            }
+        {
+            exe_dir.pop();
+        }
         search_dirs.push(exe_dir);
 
         let (sender, receiver) = channel();
@@ -106,13 +103,7 @@ impl<D, R: ResultExt<()>> Loader<D, R> {
                     DebouncedEvent::NoticeWrite(path)
                     | DebouncedEvent::Create(path)
                     | DebouncedEvent::Write(path) => {
-                        if let Some(error) = self.remove(&path, owner_data).err() {
-                            eprint!(
-                                "Failed to remove library. origin_path: {:?}, error: {}",
-                                path,
-                                error.display_chain()
-                            )
-                        }
+                        self.remove(&path, owner_data)?;
 
                         let mut load_path = path.clone();
                         let file_name: &str = load_path
@@ -124,18 +115,15 @@ impl<D, R: ResultExt<()>> Loader<D, R> {
                         let lib_name = utils::extract_lib_name(file_name).chain_err(|| {
                             format!("Failed to extract lib_name. file_name: {}", file_name)
                         })?;
-                        let live_file_name = utils::get_load_path(&OsString::from(&lib_name));
-                        load_path.set_file_name(live_file_name);
+                        load_path.pop();
+                        let load_path = utils::get_load_path(load_path, &lib_name);
                         self.add(lib_name, path, load_path, owner_data)?;
                     }
 
-                    DebouncedEvent::NoticeRemove(path)
-                    | DebouncedEvent::Remove(path)
-                    | DebouncedEvent::Rename(path, _) => {
-                        self.remove(&path, owner_data)?;
-                    }
-
-                    DebouncedEvent::Chmod(_)
+                    DebouncedEvent::NoticeRemove(_)
+                    | DebouncedEvent::Remove(_)
+                    | DebouncedEvent::Rename(_, _)
+                    | DebouncedEvent::Chmod(_)
                     | DebouncedEvent::Rescan
                     | DebouncedEvent::Error(_, _) => {}
                 },
@@ -159,14 +147,12 @@ impl<D, R: ResultExt<()>> Loader<D, R> {
         Ok(())
     }
 
-    fn search(search_dirs: &[PathBuf], lib_name: impl AsRef<OsStr>) -> Option<(PathBuf, PathBuf)> {
-        let lib_name = lib_name.as_ref();
+    fn search(search_dirs: &[PathBuf], lib_name: &str) -> Option<(PathBuf, PathBuf)> {
         let file_name = libloading::library_filename(lib_name);
         for dir in search_dirs {
             let origin_path = dir.join(&file_name);
             if origin_path.exists() {
-                let live_lib_name = utils::get_load_path(dir, lib_name);
-                let load_path = ;
+                let load_path = utils::get_load_path(dir.clone(), lib_name);
                 return Some((origin_path, load_path));
             }
         }
@@ -200,9 +186,7 @@ impl<D, R: ResultExt<()>> Loader<D, R> {
             .remove(origin_path)
             .chain_err(|| format!("Failed to find lib. origin_path: {:?}", origin_path))?;
         (self.pre_unload)(owner_data, &lib).chain_err(|| ErrorKind::PreUnloadError)?;
-        let load_path = lib.load_path.clone();
-        drop(lib);
-        self.pending_remove.push_back(load_path);
+        self.pending_remove.push_back(lib.load_path);
         Ok(())
     }
 }
@@ -224,7 +208,7 @@ impl Lib {
 }
 
 mod utils {
-    use std::ffi::{OsStr, OsString};
+
     use std::path::PathBuf;
 
     use ::error_chain::error_chain;
@@ -233,13 +217,28 @@ mod utils {
 
     error_chain! {}
 
-    pub(crate) fn get_load_path(dir: PathBuf, lib_name: &OsStr) -> OsString {
-        dir.join(libloading::library_filename(live_lib_name))
-        let live_suffix: &OsStr = "_live".as_ref();
-        let mut live_file_name = OsString::with_capacity(lib_name.len() + live_suffix.len());
-        live_file_name.push(lib_name);
-        live_file_name.push(live_suffix);
-        live_file_name
+    pub(crate) fn get_load_path(mut dir: PathBuf, lib_name: &str) -> PathBuf {
+        use std::env::consts::*;
+        const LIVE_SUFFIX: &str = "_live";
+        let mut i = 0;
+        let mut live_file_name = String::with_capacity(
+            DLL_PREFIX.len() + lib_name.len() + LIVE_SUFFIX.len() + 3 + DLL_SUFFIX.len(),
+        );
+        live_file_name += DLL_PREFIX;
+        live_file_name += lib_name;
+        live_file_name += LIVE_SUFFIX;
+        let len = live_file_name.len();
+        loop {
+            live_file_name += &i.to_string();
+            live_file_name += DLL_SUFFIX;
+            dir.push(&live_file_name);
+            if !dir.exists() {
+                return dir;
+            }
+            dir.pop();
+            live_file_name.truncate(len);
+            i += 1;
+        }
     }
 
     pub(crate) fn extract_lib_name(file_name: &str) -> Result<String> {
