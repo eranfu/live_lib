@@ -82,7 +82,7 @@ impl<P: LibPartner> Loader<P> {
 
     pub fn update(&mut self) -> Result<()> {
         while let Some(to_remove) = self.pending_remove.front() {
-            if std::fs::remove_file(&to_remove).is_err() {
+            if to_remove.exists() && std::fs::remove_file(&to_remove).is_err() {
                 break;
             } else {
                 self.pending_remove.pop_front();
@@ -181,6 +181,20 @@ impl<P: LibPartner> Loader<P> {
     }
 }
 
+impl<P: LibPartner> Drop for Loader<P> {
+    fn drop(&mut self) {
+        self.origin_path_to_lib_name.clear();
+        for (_, lib) in self.lib_name_to_lib.drain() {
+            self.pending_remove.push_back(lib.load_path.clone());
+        }
+        while let Some(to_remove) = self.pending_remove.pop_front() {
+            while to_remove.exists() && std::fs::remove_file(&to_remove).is_err() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
 pub trait LibPartner: Sized {
     type LoadResult: ResultExt<Self>;
     type UnloadResult: ResultExt<()>;
@@ -250,6 +264,11 @@ mod utils {
             if !dir.exists() {
                 return dir;
             }
+
+            if std::fs::remove_file(&dir).is_ok() {
+                return dir;
+            }
+
             dir.pop();
             live_file_name.truncate(len);
             i += 1;
