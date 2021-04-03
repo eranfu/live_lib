@@ -1,43 +1,36 @@
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, LinkedList};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::time::Duration;
 
 use ::error_chain::*;
-use libloading::Library;
+pub use libloading::Library;
 pub use libloading::Symbol;
 use notify::{DebouncedEvent, RecommendedWatcher, RecursiveMode, Watcher};
 
 error_chain! {
     errors {
-        PostLoadError
-        PreUnloadError
+        LoadError
+        UnloadError
     }
 }
 
-pub struct Loader<D, R: ResultExt<()>> {
+pub struct Loader<P: LibPartner = ()> {
     file_watcher: RecommendedWatcher,
     file_receiver: Receiver<DebouncedEvent>,
-    origin_path_to_lib: HashMap<PathBuf, Lib>,
-    name_to_origin_path: HashMap<String, PathBuf>,
-    post_load: fn(&mut D, &Lib) -> R,
-    pre_unload: fn(&mut D, &Lib) -> R,
+    lib_name_to_lib: HashMap<String, Lib<P>>,
+    origin_path_to_lib_name: HashMap<PathBuf, String>,
     search_dirs: Vec<PathBuf>,
     pending_remove: LinkedList<PathBuf>,
 }
 
-impl<D, R: ResultExt<()>> Loader<D, R> {
-    pub fn new(
-        additional_search_dirs: Vec<PathBuf>,
-        post_load: fn(&mut D, &Lib) -> R,
-        pre_unload: fn(&mut D, &Lib) -> R,
-    ) -> Result<Self> {
+impl<P: LibPartner> Loader<P> {
+    pub fn new(additional_search_dirs: Vec<PathBuf>) -> Result<Self> {
         let mut search_dirs = additional_search_dirs;
         let mut exe_dir = std::env::current_exe().chain_err(|| "Failed to get current_exe")?;
         exe_dir.pop();
-        #[cfg(test)]
-        {
+        if exe_dir.file_name() == Some(OsStr::new("deps")) {
             exe_dir.pop();
         }
         search_dirs.push(exe_dir);
@@ -47,47 +40,47 @@ impl<D, R: ResultExt<()>> Loader<D, R> {
             file_watcher: notify::watcher(sender, Duration::from_secs(2))
                 .chain_err(|| "Failed to watch file change")?,
             file_receiver: receiver,
-            origin_path_to_lib: Default::default(),
-            name_to_origin_path: Default::default(),
-            post_load,
-            pre_unload,
+            lib_name_to_lib: Default::default(),
+            origin_path_to_lib_name: Default::default(),
             search_dirs,
             pending_remove: Default::default(),
         })
     }
 
-    pub fn add_library(&mut self, lib_name: &str, owner_data: &mut D) -> Result<()> {
-        let (origin_path, load_path) = match self.name_to_origin_path.entry(lib_name.to_owned()) {
-            Entry::Occupied(_occupied) => return Ok(()),
-            Entry::Vacant(vacant_origin_path) => {
-                let (origin_path, load_path) = Self::search(&self.search_dirs, lib_name)
-                    .chain_err(|| format!("Library not exists. name: {}", lib_name))?;
-                (vacant_origin_path.insert(origin_path).clone(), load_path)
-            }
-        };
-        self.add(
-            lib_name.to_owned(),
-            origin_path.clone(),
-            load_path,
-            owner_data,
-        )?;
+    pub fn add_library(&mut self, lib_name: &str) -> Result<()> {
+        if self.lib_name_to_lib.contains_key(lib_name) {
+            return Ok(());
+        }
+
+        let (origin_path, load_path) = Self::search(&self.search_dirs, lib_name)
+            .chain_err(|| format!("Library not exists. name: {}", lib_name))?;
+
+        self.add(lib_name.to_owned(), origin_path.clone(), load_path)?;
         self.file_watcher
             .watch(&origin_path, RecursiveMode::NonRecursive)
-            .chain_err(|| format!("Failed to watch file. path: {:?}", origin_path))
+            .chain_err(|| format!("Failed to watch file. path: {:?}", origin_path))?;
+        Ok(())
     }
 
-    pub fn remove_library(&mut self, lib_name: &str, owner_data: &mut D) -> Result<()> {
-        if let Some(origin_path) = self.name_to_origin_path.remove(lib_name) {
+    pub fn remove_library(&mut self, lib_name: &str) -> Result<()> {
+        if let Some(lib) = self.lib_name_to_lib.get(lib_name) {
             self.file_watcher
-                .unwatch(&origin_path)
-                .chain_err(|| format!("Failed to unwatch file. path: {:?}", origin_path))?;
-            self.remove(&origin_path, owner_data)?;
+                .unwatch(&lib.origin_path)
+                .chain_err(|| format!("Failed to unwatch file. path: {:?}", lib.origin_path))?;
+            let origin_path = lib.origin_path.clone();
+            self.remove(&origin_path)?;
         }
 
         Ok(())
     }
 
-    pub fn update(&mut self, owner_data: &mut D) -> Result<()> {
+    pub fn get(&self, lib_name: &str) -> Option<(&Library, &P)> {
+        self.lib_name_to_lib
+            .get(lib_name)
+            .map(|lib| (&lib.lib, lib.partner.as_ref().unwrap()))
+    }
+
+    pub fn update(&mut self) -> Result<()> {
         while let Some(to_remove) = self.pending_remove.front() {
             if std::fs::remove_file(&to_remove).is_err() {
                 break;
@@ -100,27 +93,24 @@ impl<D, R: ResultExt<()>> Loader<D, R> {
             let event = self.file_receiver.try_recv();
             match event {
                 Ok(event) => match event {
-                    DebouncedEvent::NoticeWrite(path)
-                    | DebouncedEvent::Create(path)
-                    | DebouncedEvent::Write(path) => {
-                        self.remove(&path, owner_data)?;
+                    DebouncedEvent::Create(path) | DebouncedEvent::Write(path) => {
+                        self.remove(&path)?;
 
-                        let mut load_path = path.clone();
-                        let file_name: &str = load_path
+                        let mut dir = path.clone();
+                        let file_name: &str = dir
                             .file_name()
                             .and_then(|file_name| file_name.to_str())
-                            .chain_err(|| {
-                                format!("Failed to get filename. path: {:?}", load_path)
-                            })?;
+                            .chain_err(|| format!("Failed to get filename. path: {:?}", dir))?;
                         let lib_name = utils::extract_lib_name(file_name).chain_err(|| {
                             format!("Failed to extract lib_name. file_name: {}", file_name)
                         })?;
-                        load_path.pop();
-                        let load_path = utils::get_load_path(load_path, &lib_name);
-                        self.add(lib_name, path, load_path, owner_data)?;
+                        dir.pop();
+                        let load_path = utils::get_load_path(dir, &lib_name);
+                        self.add(lib_name, path, load_path)?;
                     }
 
-                    DebouncedEvent::NoticeRemove(_)
+                    DebouncedEvent::NoticeWrite(_)
+                    | DebouncedEvent::NoticeRemove(_)
                     | DebouncedEvent::Remove(_)
                     | DebouncedEvent::Rename(_, _)
                     | DebouncedEvent::Chmod(_)
@@ -159,56 +149,81 @@ impl<D, R: ResultExt<()>> Loader<D, R> {
         None
     }
 
-    fn add(
-        &mut self,
-        lib_name: String,
-        origin_path: PathBuf,
-        load_path: PathBuf,
-        owner_data: &mut D,
-    ) -> Result<()> {
+    fn add(&mut self, lib_name: String, origin_path: PathBuf, load_path: PathBuf) -> Result<()> {
         Self::copy(&origin_path, &load_path)?;
 
         let lib = unsafe { Library::new(&load_path) }
             .chain_err(|| format!("Failed to load library. path: {:?}", load_path))?;
-        let lib = Lib {
+        let mut lib = Lib {
             lib,
-            name: lib_name,
+            lib_name,
             load_path,
             origin_path,
+            partner: None,
         };
-        (self.post_load)(owner_data, &lib).chain_err(|| ErrorKind::PostLoadError)?;
-        self.origin_path_to_lib.insert(lib.origin_path.clone(), lib);
+        lib.partner = Some(P::load(&lib.lib).chain_err(|| ErrorKind::LoadError)?);
+        self.origin_path_to_lib_name
+            .insert(lib.origin_path.clone(), lib.lib_name.clone());
+        self.lib_name_to_lib.insert(lib.lib_name.clone(), lib);
         Ok(())
     }
-    fn remove(&mut self, origin_path: &Path, owner_data: &mut D) -> Result<()> {
-        let lib = self
-            .origin_path_to_lib
+    fn remove(&mut self, origin_path: &Path) -> Result<()> {
+        let lib_name = self
+            .origin_path_to_lib_name
             .remove(origin_path)
-            .chain_err(|| format!("Failed to find lib. origin_path: {:?}", origin_path))?;
-        (self.pre_unload)(owner_data, &lib).chain_err(|| ErrorKind::PreUnloadError)?;
-        self.pending_remove.push_back(lib.load_path);
+            .chain_err(|| format!("Failed to find lib_name. origin_path: {:?}", origin_path))?;
+        let lib = self
+            .lib_name_to_lib
+            .remove(&lib_name)
+            .chain_err(|| format!("Failed to find lib. lib_name: {:?}", lib_name))?;
+        self.pending_remove.push_back(lib.load_path.clone());
         Ok(())
     }
 }
 
-pub struct Lib {
+pub trait LibPartner: Sized {
+    type LoadResult: ResultExt<Self>;
+    type UnloadResult: ResultExt<()>;
+    fn load(lib: &Library) -> Self::LoadResult;
+    fn unload(&mut self, lib: &Library) -> Self::UnloadResult;
+}
+
+impl LibPartner for () {
+    type LoadResult = Result<Self>;
+    type UnloadResult = Result<()>;
+
+    fn load(_lib: &Library) -> Self::LoadResult {
+        Ok(())
+    }
+
+    fn unload(&mut self, _lib: &Library) -> Self::UnloadResult {
+        Ok(())
+    }
+}
+
+struct Lib<P: LibPartner> {
     lib: Library,
-    name: String,
+    lib_name: String,
     load_path: PathBuf,
     origin_path: PathBuf,
+    partner: Option<P>,
 }
 
-impl Lib {
-    pub fn name(&self) -> &String {
-        &self.name
-    }
-    pub fn lib(&self) -> &Library {
-        &self.lib
+impl<P: LibPartner> Drop for Lib<P> {
+    fn drop(&mut self) {
+        if let Some(err) = self
+            .partner
+            .take()
+            .map(|mut p| p.unload(&self.lib))
+            .chain_err(|| ErrorKind::UnloadError)
+            .err()
+        {
+            eprintln!("{}", err.display_chain());
+        }
     }
 }
 
 mod utils {
-
     use std::path::PathBuf;
 
     use ::error_chain::error_chain;
