@@ -49,6 +49,14 @@ impl<P: LibPartner> Loader<P> {
         })
     }
 
+    pub fn add_search_dir(&mut self, dir: PathBuf) {
+        self.search_dirs.push(dir)
+    }
+
+    pub fn add_search_dirs(&mut self, mut dirs: Vec<PathBuf>) {
+        self.search_dirs.append(&mut dirs)
+    }
+
     pub fn add_library(&mut self, lib_name: &str) -> Result<()> {
         if self.lib_name_to_lib.contains_key(lib_name) {
             return Ok(());
