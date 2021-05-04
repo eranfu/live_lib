@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::mpsc::{channel, TryRecvError};
 use std::time::Duration;
 
 use ::error_chain::*;
@@ -18,9 +18,13 @@ error_chain! {
     }
 }
 
-pub struct Loader<P: LibPartner = ()> {
+struct Receiver(std::sync::mpsc::Receiver<DebouncedEvent>);
+
+unsafe impl Sync for Receiver {}
+
+pub struct Loader<P: LibPartner = DummyPartner> {
     file_watcher: RecommendedWatcher,
-    file_receiver: Receiver<DebouncedEvent>,
+    file_receiver: Receiver,
     lib_name_to_lib: HashMap<String, Lib<P>>,
     origin_path_to_lib_name: HashMap<PathBuf, String>,
     search_dirs: Vec<PathBuf>,
@@ -41,7 +45,7 @@ impl<P: LibPartner> Loader<P> {
         Ok(Self {
             file_watcher: notify::watcher(sender, Duration::from_secs(2))
                 .chain_err(|| "Failed to watch file change")?,
-            file_receiver: receiver,
+            file_receiver: Receiver(receiver),
             lib_name_to_lib: Default::default(),
             origin_path_to_lib_name: Default::default(),
             search_dirs,
@@ -101,7 +105,7 @@ impl<P: LibPartner> Loader<P> {
         }
 
         loop {
-            let event = self.file_receiver.try_recv();
+            let event = self.file_receiver.0.try_recv();
             match event {
                 Ok(event) => match event {
                     DebouncedEvent::Create(path) | DebouncedEvent::Write(path) => {
@@ -254,12 +258,14 @@ pub trait LibPartner: Sized {
     fn unload(&mut self, lib: &Library) -> Self::UnloadResult;
 }
 
-impl LibPartner for () {
+pub struct DummyPartner;
+
+impl LibPartner for DummyPartner {
     type LoadResult = Result<Self>;
     type UnloadResult = Result<()>;
 
     fn load(_lib: &Library) -> Self::LoadResult {
-        Ok(())
+        Ok(DummyPartner)
     }
 
     fn unload(&mut self, _lib: &Library) -> Self::UnloadResult {
